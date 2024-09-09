@@ -16,6 +16,7 @@ from __future__ import absolute_import
 
 import sys
 from datetime import datetime, timedelta
+from six.moves import http_client
 
 if sys.version_info[:2] <= (2, 6):
     import unittest2 as unittest
@@ -23,7 +24,8 @@ else:
     import unittest
 
 import pytest
-from impala.util import cookie_matches_path, get_cookie_expiry, get_all_matching_cookies
+from impala.util import (cookie_matches_path, get_cookie_expiry, get_all_cookies,
+                         get_all_matching_cookies)
 
 
 class ImpalaUtilTests(unittest.TestCase):
@@ -77,14 +79,78 @@ class ImpalaUtilTests(unittest.TestCase):
         now = datetime.now()
         assert now + days2k <= get_cookie_expiry({'max-age': '172800000'}) <= now + days2k + sec
 
+    def test_get_matching_cookies(self):
+        cookies = get_all_cookies('/path', {})
+        assert not cookies
+
+        headers = make_cookie_headers([
+            ('c_cookie', 'c_value'),
+            ('b_cookie', 'b_value'),
+            ('a_cookie', 'a_value')
+        ])
+        cookies = csort(get_all_cookies('/path', headers))
+        assert len(cookies) == 3
+        assert cookies[0].key == 'a_cookie' and cookies[0].value == 'a_value'
+        assert cookies[1].key == 'b_cookie' and cookies[1].value == 'b_value'
+        assert cookies[2].key == 'c_cookie' and cookies[2].value == 'c_value'
+
+        headers = make_cookie_headers([
+            ('c_cookie', 'c_value;Path=/'),
+            ('b_cookie', 'b_value;Path=/path'),
+            ('a_cookie', 'a_value;Path=/')
+        ])
+        cookies = csort(get_all_cookies('/path', headers))
+        assert len(cookies) == 3
+        assert cookies[0].key == 'a_cookie' and cookies[0].value == 'a_value'
+        assert cookies[1].key == 'b_cookie' and cookies[1].value == 'b_value'
+        assert cookies[2].key == 'c_cookie' and cookies[2].value == 'c_value'
+
+        headers = make_cookie_headers([
+            ('c_cookie', 'c_value;Path=/'),
+            ('B_cookie', 'B_value;Path=/path'),
+            ('a_cookie', 'a_value;Path=/path/path2')
+        ])
+        cookies = csort(get_all_cookies('/path', headers))
+        assert len(cookies) == 2
+        assert cookies[0].key == 'B_cookie' and cookies[0].value == 'B_value'
+        assert cookies[1].key == 'c_cookie' and cookies[1].value == 'c_value'
+
+        headers = make_cookie_headers([
+            ('c_cookie', 'c_value;Path=/'),
+            ('b_cookie', 'b_value;Path=/path'),
+            ('a_cookie', 'a_value;Path=/path')
+        ])
+        cookies = csort(get_all_cookies('/path/path1', headers))
+        assert len(cookies) == 3
+        assert cookies[0].key == 'a_cookie' and cookies[0].value == 'a_value'
+        assert cookies[1].key == 'b_cookie' and cookies[1].value == 'b_value'
+        assert cookies[2].key == 'c_cookie' and cookies[2].value == 'c_value'
+
+        headers = make_cookie_headers([
+            ('b_cookie', 'b_value;Path=/path1'),
+            ('a_cookie', 'a_value;Path=/path2')
+        ])
+        cookies = get_all_cookies('/path', headers)
+        assert not cookies
+
+        headers = make_cookie_headers([
+            ('c_cookie', 'c_value;Path=/'),
+            ('b_cookie', 'b_value;Path=/path1'),
+            ('a_cookie', 'a_value;Path=/path2')
+        ])
+        cookies = get_all_cookies('/path', headers)
+        assert len(cookies) == 1
+        assert cookies[0].key == 'c_cookie' and cookies[0].value == 'c_value'
 
     def test_get_all_matching_cookies(self):
         cookies = get_all_matching_cookies(['a', 'b'], '/path', {})
         assert not cookies
 
-        headers = {'Set-Cookie': '''c_cookie=c_value
-        b_cookie=b_value
-        a_cookie=a_value'''}
+        headers = make_cookie_headers([
+            ('c_cookie', 'c_value'),
+            ('b_cookie', 'b_value'),
+            ('a_cookie', 'a_value')
+        ])
         cookies = get_all_matching_cookies(['a_cookie', 'b_cookie'], '/path', headers)
         assert len(cookies) == 2
         assert cookies[0].key == 'a_cookie' and cookies[0].value == 'a_value'
@@ -94,17 +160,21 @@ class ImpalaUtilTests(unittest.TestCase):
         assert cookies[0].key == 'b_cookie' and cookies[0].value == 'b_value'
         assert cookies[1].key == 'a_cookie' and cookies[1].value == 'a_value'
 
-        headers = {'Set-Cookie': '''c_cookie=c_value;Path=/
-        b_cookie=b_value;Path=/path
-        a_cookie=a_value;Path=/'''}
+        headers = make_cookie_headers([
+            ('c_cookie', 'c_value;Path=/'),
+            ('b_cookie', 'b_value;Path=/path'),
+            ('a_cookie', 'a_value;Path=/')
+        ])
         cookies = get_all_matching_cookies(['a_cookie', 'b_cookie'], '/path', headers)
         assert len(cookies) == 2
         assert cookies[0].key == 'a_cookie' and cookies[0].value == 'a_value'
         assert cookies[1].key == 'b_cookie' and cookies[1].value == 'b_value'
 
-        headers = {'Set-Cookie': '''c_cookie=c_value;Path=/
-        b_cookie=b_value;Path=/path
-        a_cookie=a_value;Path=/path/path2'''}
+        headers = make_cookie_headers([
+            ('c_cookie', 'c_value;Path=/'),
+            ('b_cookie', 'b_value;Path=/path'),
+            ('a_cookie', 'a_value;Path=/path/path2')
+        ])
         cookies = get_all_matching_cookies(['a_cookie', 'b_cookie'], '/path', headers)
         assert len(cookies) == 1
         assert cookies[0].key == 'b_cookie' and cookies[0].value == 'b_value'
@@ -112,25 +182,63 @@ class ImpalaUtilTests(unittest.TestCase):
         assert len(cookies) == 1
         assert cookies[0].key == 'b_cookie' and cookies[0].value == 'b_value'
 
-        headers = {'Set-Cookie': '''c_cookie=c_value;Path=/
-        b_cookie=b_value;Path=/path
-        a_cookie=a_value;Path=/path'''}
+        headers = make_cookie_headers([
+            ('c_cookie', 'c_value;Path=/'),
+            ('b_cookie', 'b_value;Path=/path'),
+            ('a_cookie', 'a_value;Path=/path')
+        ])
         cookies = get_all_matching_cookies(['a_cookie', 'b_cookie'], '/path/path1',
             headers)
         assert len(cookies) == 2
         assert cookies[0].key == 'a_cookie' and cookies[0].value == 'a_value'
         assert cookies[1].key == 'b_cookie' and cookies[1].value == 'b_value'
 
-        headers = {'Set-Cookie': '''c_cookie=c_value;Path=/
-        b_cookie=b_value;Path=/path1
-        a_cookie=a_value;Path=/path2'''}
+        headers = make_cookie_headers([
+            ('c_cookie', 'c_value;Path=/'),
+            ('b_cookie', 'b_value;Path=/path1'),
+            ('a_cookie', 'a_value;Path=/path2')
+        ])
         cookies = get_all_matching_cookies(['a_cookie', 'b_cookie'], '/path', headers)
         assert not cookies
 
-        headers = {'Set-Cookie': '''c_cookie=c_value;Path=/
-        b_cookie=b_value;Path=/path1
-        a_cookie=a_value;Path=/path2'''}
+        headers = make_cookie_headers([
+            ('c_cookie', 'c_value;Path=/'),
+            ('b_cookie', 'b_value;Path=/path1'),
+            ('a_cookie', 'a_value;Path=/path2')
+        ])
         cookies = get_all_matching_cookies(['a_cookie', 'b_cookie', 'c_cookie'], '/path',
             headers)
         assert len(cookies) == 1
         assert cookies[0].key == 'c_cookie' and cookies[0].value == 'c_value'
+
+
+def make_cookie_headers(cookie_vals):
+    """Make an HTTPMessage containing Set-Cookie headers for Python 2 or Python 3"""
+    if sys.version_info.major == 2:
+        # In Python 2 the HTTPMessage is a mimetools.Message object, and the
+        # Set-Cookie values all appear in a single header, separated by newlines.
+        cookies = ""
+        count = 0
+        for pair in cookie_vals:
+            name = pair[0]
+            value = pair[1]
+            cookies += name + '=' + value
+            if count + 1 < len(cookie_vals):
+                # Separate the cookies, unless it is the last cookie.
+                cookies += '\n '
+            count += 1
+        return {'Set-Cookie': cookies}
+    else:
+        # In Python 3 the HTTPMessage is an email.message.Message, and the
+        # Set-Cookie values appear as duplicate headers.
+        headers = http_client.HTTPMessage()
+        for pair in cookie_vals:
+            name = pair[0]
+            value = pair[1]
+            headers.add_header('Set-Cookie', name + "=" + value)
+        return headers
+
+def csort(cookies):
+    """Sort list of Morsels as header order is not guaranteed."""
+    cookies.sort(key=lambda c: c.key)
+    return cookies

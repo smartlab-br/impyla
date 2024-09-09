@@ -1,6 +1,56 @@
 Changelog
 =========
 
+0.20a3
+------
+* **Bug Fixes**
+  - Always set ImpalaHttpClient.__preserve_all_cookies (#553)
+
+0.20a2
+------
+* **Improvements**
+  - Support wildcard http_cookie_names (#509)
+  - Allow skipping utf8 conversion in Python3 (#548)
+  - Subtract RPC time from sleep in _wait_to_finish (#551)
+  - Reduced logging:
+    - Log "Closing operation" at debug level (#539)
+    - Never log passwords in http connections (#545)
+      - Before the fix passwords were logged at debug level
+
+* **Bug Fixes**
+  - Turn regex strings into raw strings (#535)
+  - Fix SQLAlchemy support for Impala on Python 3.10 (#538)
+  - Avoid retrying non-idempotent RPCs in binary connections (#549)
+
+0.20a1
+------
+* **Improvements**
+  - Add Knox cookies in default cookies list (#525)
+  - Support CHAR type in SQLAlchemy (#516)
+  - Support Cursor.rowcount and close finished queries (#528)
+    Note that this is a potentially breaking change. See the PR
+    for details about the side-effects.
+    The old behavior can be restored by setting close_finished_queries=False
+    when creating a Cursor.
+    Also note that Cursor.rowcount only works with Impala server - with
+    Hive it will always return -1.
+
+* **Bug Fixes**
+  - Fix https connection with Python 3.12 (#531)
+    Note that Python 3.12 support is not complete yet.
+    A known issue is that installing with setuptools fails with Python 3.12.
+
+0.19.0
+------
+* **Improvements**
+  - Add get_view_name support to SQLAlchemy (#511)
+    SHOW VIEWS is expected to be supported in Impala soon.
+  - Add additional checks to ensure connection arguments (#515)
+
+* **Bug Fixes**
+  - Fix Cookie handling with Python 3 (#518)
+  - Fix numeric parameter substitution bug (#508)
+
 0.18.0
 ------
 * **Improvements**

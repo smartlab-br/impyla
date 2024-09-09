@@ -37,7 +37,7 @@ from impala._thrift_gen.TCLIService.ttypes import (
     TGetOperationStatusReq, TOperationState, TCancelOperationReq,
     TCloseOperationReq, TGetLogReq, TProtocolVersion)
 from impala._thrift_gen.ImpalaService.ImpalaHiveServer2Service import (
-    TGetRuntimeProfileReq, TGetExecSummaryReq)
+    TGetRuntimeProfileReq, TGetExecSummaryReq, TCloseImpalaOperationReq)
 from impala._thrift_api import (
     get_socket, get_http_transport, get_transport, ThriftClient)
 from impala._thrift_gen.RuntimeProfile.ttypes import TRuntimeProfileFormat
@@ -84,7 +84,8 @@ class HiveServer2Connection(Connection):
         raise NotSupportedError
 
     def cursor(self, user=None, configuration=None, convert_types=True,
-               dictify=False, fetch_error=True):
+               dictify=False, fetch_error=True, close_finished_queries=True,
+               convert_strings_to_unicode=True):
         """Get a cursor from the HiveServer2 (HS2) connection.
 
         Parameters
@@ -96,6 +97,12 @@ class HiveServer2Connection(Connection):
             When `False`, timestamps and decimal values will not be converted
             to Python `datetime` and `Decimal` values. (These conversions are
             expensive.) Only applies when using HS2 protocol versions > 6.
+        convert_strings_to_unicode : bool, optional
+            When `True`, the following types, which are transmitted as strings
+            in HS2 protocol, will be converted to unicode: STRING, LIST, MAP, 
+            STRUCT, UNIONTYPE, NULL, VARCHAR, CHAR, TIMESTAMP, DECIMAL, DATE.
+            When `False`, conversion will occur only for types expected by 
+            convert_types in python3: TIMESTAMP, DECIMAL, DATE.
         dictify : bool, optional
             When `True` cursor will return key value pairs instead of rows.
         fetch_error : bool, optional
@@ -112,6 +119,20 @@ class HiveServer2Connection(Connection):
             handle remains valid and impyla will raise an exception with a
             message of "Operation is in ERROR_STATE".
             The Default option is `True`.
+        close_finished_queries : bool, optional
+            If True, queries are closed after:
+                - queries with results set: all rows are returned with fetch
+                - DDL/DML: execution is finished
+            If False, then the query will be only closed when:
+                - execute() is called again on the cursor with a new query
+                - close() is called on the cursor
+                - the cursor's destructor is called
+            Property 'rowcount' will not be available in the 'False' case for DML
+            statements.
+            Before closing the query GetLog() is called as this will be no longer
+            possible after closing.
+            The Default option is `True`.
+
 
         Returns
         -------
@@ -136,7 +157,9 @@ class HiveServer2Connection(Connection):
         cursor_class = HiveServer2DictCursor if dictify else HiveServer2Cursor
 
         cursor = cursor_class(session, convert_types=convert_types,
-                              fetch_error=fetch_error)
+                              fetch_error=fetch_error,
+                              close_finished_queries=close_finished_queries,
+                              convert_strings_to_unicode=convert_strings_to_unicode)
 
         if self.default_db is not None:
             log.info('Using database %s as default', self.default_db)
@@ -153,16 +176,20 @@ class HiveServer2Cursor(Cursor):
     # HiveServer2Cursor objects are associated with a Session
     # they are instantiated with alive session_handles
 
-    def __init__(self, session, convert_types=True, fetch_error=True):
+    def __init__(self, session, convert_types=True, fetch_error=True, close_finished_queries=True,
+                 convert_strings_to_unicode=True):
         self.session = session
         self.convert_types = convert_types
+        self.convert_strings_to_unicode = convert_strings_to_unicode
         self.fetch_error = fetch_error
+        self.close_finished_queries = close_finished_queries
 
         self._last_operation = None
 
         self._last_operation_string = None
         self._last_operation_active = False
         self._last_operation_finished = False
+        self._last_operation_log = None
         self._buffersize = None
         self._buffer = Batch()  # zero-length
 
@@ -203,9 +230,12 @@ class HiveServer2Cursor(Cursor):
 
     @property
     def rowcounts(self):
-        # Work around to get the number of rows modified for Inserts/Update/Delte statements
+        # Work around to get the number of rows modified for Inserts/Update/Delete statements
+        # Todo: For the non-Kudu case, this function could use self._rowcount without fetching
+        #       and parsing the profile. This wouldn't be enough for Kudu as NumRowErrors is not
+        #       included in DmlResult.
         modifiedRows, errorRows = -1, -1
-        if self._last_operation_active:
+        if self._last_operation is not None:
             logList = self.get_profile().split('\n')
             resultDict = {}
             subs = ['NumModifiedRows', 'NumRowErrors']
@@ -299,8 +329,8 @@ class HiveServer2Cursor(Cursor):
                 self._reset_state()
 
     def close_operation(self):
-        if self._last_operation_active:
-            log.info('Closing active operation')
+        if self._last_operation is not None:
+            log.debug('Closing operation')
             self._reset_state()
 
     def _reset_state(self):
@@ -314,11 +344,32 @@ class HiveServer2Cursor(Cursor):
         self._last_operation_finished = False
         self._last_operation_string = None
         self._last_operation = None
+        self._last_operation_log = None
+        self._rowcount = -1
+
+    def _set_rowcount_from_close_result(self, close_result):
+        if not hasattr(close_result, 'dml_result') or not close_result.dml_result:
+            return
+        rows_modified_per_partition = close_result.dml_result.rows_modified
+        self._rowcount = 0
+        for _, val in rows_modified_per_partition.items():
+            self._rowcount += val
+
+    def _close_finished_operation(self):
+        # Save the log as it can't be accessed after closing the query.
+        self._last_operation_log = self.get_log()
+        self._last_operation_active = False
+        close_result = self._last_operation.close()
+        log.debug('Query closed')
+        # Set rowcount for DMLs.
+        self._set_rowcount_from_close_result(close_result)
 
     def execute(self, operation, parameters=None, configuration=None):
         """Synchronously execute a SQL query.
 
         Blocks until results are available.
+        For DMLs/DDLs if close_finished_queries is true then the query is
+        closed once finished.
 
         Parameters
         ----------
@@ -342,6 +393,10 @@ class HiveServer2Cursor(Cursor):
         log.debug('Waiting for query to finish')
         self._wait_to_finish()  # make execute synchronous
         log.debug('Query finished')
+        if not self.has_result_set and self.close_finished_queries:
+            # Close query if no results need to be fetched.
+            self._close_finished_operation()
+
 
     def execute_async(self, operation, parameters=None, configuration=None):
         """Asynchronously execute a SQL query.
@@ -388,7 +443,7 @@ class HiveServer2Cursor(Cursor):
         self._execute_async(op)
 
     def _debug_log_state(self):
-        if self._last_operation_active:
+        if self._last_operation is not None:
             handle = self._last_operation.handle
         else:
             handle = None
@@ -416,6 +471,7 @@ class HiveServer2Cursor(Cursor):
             return
         loop_start = time.time()
         while True:
+            start_rpc_time = time.time()
             req = TGetOperationStatusReq(operationHandle=self._last_operation.handle)
             resp = self._last_operation._rpc('GetOperationStatus', req, True)
             self._last_operation.update_has_result_set(resp)
@@ -435,7 +491,13 @@ class HiveServer2Cursor(Cursor):
             if not self._op_state_is_executing(operation_state):
                 self._last_operation_finished = True
                 break
-            time.sleep(self._get_sleep_interval(loop_start))
+            rpc_time = time.time() - start_rpc_time
+            sleep_time = self._get_sleep_interval(loop_start)
+            # Subtract RPC time from the total sleep time. If query option
+            # long_polling_time_ms is set then Impala will sleep in GetOperationStatus
+            # meaning that impyla may not need to sleep at all (IMPALA-13294).
+            if rpc_time < sleep_time:
+                time.sleep(sleep_time - rpc_time)
 
     def status(self):
         if self._last_operation is None:
@@ -478,11 +540,18 @@ class HiveServer2Cursor(Cursor):
     def executemany(self, operation, seq_of_parameters, configuration=None):
         # PEP 249
         log.debug('Attempting to execute %s queries', len(seq_of_parameters))
+        rowcount = -1
         for parameters in seq_of_parameters:
             self.execute(operation, parameters, configuration)
             if self.has_result_set:
                 raise ProgrammingError("Operations that have result sets are "
                                        "not allowed with executemany.")
+            if self._rowcount != -1:
+                if rowcount == -1:
+                    rowcount = self._rowcount
+                else:
+                    rowcount += self._rowcount
+        self._rowcount = rowcount
 
     def fetchone(self):
         # PEP 249
@@ -518,7 +587,8 @@ class HiveServer2Cursor(Cursor):
             batch = (self._last_operation.fetch(
                          self.description,
                          self.buffersize,
-                         convert_types=self.convert_types))
+                         convert_types=self.convert_types,
+                         convert_strings_to_unicode=self.convert_strings_to_unicode))
             if len(batch) == 0:
                return None
             return batch
@@ -568,7 +638,8 @@ class HiveServer2Cursor(Cursor):
             batch = (self._last_operation.fetch(
                          self.description,
                          self.buffersize,
-                         convert_types=self.convert_types))
+                         convert_types=self.convert_types,
+                         convert_strings_to_unicode=self.convert_strings_to_unicode))
             if len(batch) == 0:
                 break
             batches.append(batch)
@@ -591,9 +662,12 @@ class HiveServer2Cursor(Cursor):
     def __next__(self):
         self._ensure_buffer_is_filled()
         log.debug('__next__: popping row out of buffer')
+        self._rowcount += 1
         return self._buffer.pop()
 
     def _ensure_buffer_is_filled(self):
+        if self._rowcount == -1:
+            self._rowcount = 0
         while True:
             if not self.has_result_set:
                 raise ProgrammingError(
@@ -604,12 +678,19 @@ class HiveServer2Cursor(Cursor):
                 log.debug('_ensure_buffer_is_filled: buffer empty and op is active '
                           '=> fetching more data')
                 self._buffer = self._last_operation.fetch(self.description,
-                                                          self.buffersize,
-                                                          convert_types=self.convert_types)
+                    self.buffersize,
+                    convert_types=self.convert_types,
+                    convert_strings_to_unicode=self.convert_strings_to_unicode)
                 if len(self._buffer) > 0:
                     return
                 if not self._buffer.expect_more_rows:
                     log.debug('_ensure_buffer_is_filled: no more data to fetch')
+                    if self.close_finished_queries:
+                        # Close query as it no longer has rows.
+                        # TODO: this could be done earlier after calling fetch - not sure
+                        #       if this would bring enough benefits to worth complicating
+                        #       the state machine
+                        self._close_finished_operation()
                     raise StopIteration
                 # If we didn't get rows, but more are expected, need to iterate again.
             else:
@@ -619,7 +700,9 @@ class HiveServer2Cursor(Cursor):
     def _pop_from_buffer(self, size):
         self._ensure_buffer_is_filled()
         log.debug('pop_from_buffer: popping row out of buffer')
-        return self._buffer.pop_many(size)
+        elements = self._buffer.pop_many(size)
+        self._rowcount += len(elements)
+        return elements
 
     def ping(self):
         """Checks connection to server by requesting some info."""
@@ -629,6 +712,9 @@ class HiveServer2Cursor(Cursor):
     def get_log(self):
         if self._last_operation is None:
             raise ProgrammingError("Operation state is not available")
+        if self._last_operation_log is not None:
+            # Return the log saved before closing the query.
+            return self._last_operation_log
         return self._last_operation.get_log()
 
     def get_profile(self, profile_format=TRuntimeProfileFormat.STRING):
@@ -946,7 +1032,8 @@ class Column(object):
 
 class CBatch(Batch):
 
-    def __init__(self, trowset, expect_more_rows, schema, convert_types=True):
+    def __init__(self, trowset, expect_more_rows, schema, convert_types=True,
+                 convert_strings_to_unicode=True):
         self.expect_more_rows = expect_more_rows
         self.schema = schema
         tcols = [_TTypeId_to_TColumnValue_getters[schema[i][1]](col)
@@ -957,6 +1044,9 @@ class CBatch(Batch):
 
         log.debug('CBatch: input TRowSet num_cols=%s num_rows=%s tcols=%s',
                   num_cols, num_rows, tcols)
+        
+        HS2_STRING_TYPES = ["STRING", "LIST", "MAP", "STRUCT", "UNIONTYPE", "NULL", "VARCHAR", "CHAR", "TIMESTAMP", "DECIMAL", "DATE"]
+        CONVERTED_TYPES=["TIMESTAMP", "DECIMAL", "DATE"]
 
         self.columns = []
         for j in range(num_cols):
@@ -974,13 +1064,31 @@ class CBatch(Batch):
 
             # STRING columns are read as binary and decoded here to be able to handle
             # non-valid utf-8 strings in Python 3.
+
             if six.PY3:
-                self._convert_strings_to_unicode(type_, is_null, values)
+                if convert_strings_to_unicode:
+                    self._convert_strings_to_unicode(type_, is_null, values, types=HS2_STRING_TYPES)
+                elif convert_types:
+                    self._convert_strings_to_unicode(type_, is_null, values, types=CONVERTED_TYPES)
 
             if convert_types:
                 values = self._convert_values(type_, is_null, values)
 
             self.columns.append(Column(type_, values, is_null))
+
+    def _convert_strings_to_unicode(self, type_, is_null, values, types):
+        if type_ in types:
+            for i in range(len(values)):
+                if is_null[i]:
+                    values[i] = None
+                    continue
+                try:
+                    # Do similar handling of non-valid UTF-8 strings as Thriftpy2:
+                    # https://github.com/Thriftpy/thriftpy2/blob/8e218b3fd89c597c2e83d129efecfe4d280bdd89/thriftpy2/protocol/binary.py#L241
+                    # If decoding fails then keep the original bytearray.
+                    values[i] = values[i].decode("UTF-8")
+                except UnicodeDecodeError:
+                    pass
 
     def _convert_values(self, type_, is_null, values):
         # pylint: disable=consider-using-enumerate
@@ -995,20 +1103,6 @@ class CBatch(Batch):
             for i in range(len(values)):
                 values[i] = (None if is_null[i] else _parse_date(values[i]))
         return values
-
-    def _convert_strings_to_unicode(self, type_, is_null, values):
-        if type_ in ["STRING", "LIST", "MAP", "STRUCT", "UNIONTYPE", "DECIMAL", "DATE", "TIMESTAMP", "NULL", "VARCHAR", "CHAR"]:
-            for i in range(len(values)):
-                if is_null[i]:
-                    values[i] = None
-                    continue
-                try:
-                    # Do similar handling of non-valid UTF-8 strings as Thriftpy2:
-                    # https://github.com/Thriftpy/thriftpy2/blob/8e218b3fd89c597c2e83d129efecfe4d280bdd89/thriftpy2/protocol/binary.py#L241
-                    # If decoding fails then keep the original bytearray.
-                    values[i] = values[i].decode("UTF-8")
-                except UnicodeDecodeError:
-                    pass
 
     def __len__(self):
         return self.remaining_rows
@@ -1078,41 +1172,40 @@ class ThriftRPC(object):
         self.client = client
         self.retries = retries
 
-    def _rpc(self, func_name, request, retry_on_http_error=False):
+    def _rpc(self, func_name, request, safe_to_retry=False):
         self._log_request(func_name, request)
-        response = self._execute(func_name, request, retry_on_http_error)
+        response = self._execute(func_name, request, safe_to_retry)
         self._log_response(func_name, response)
         err_if_rpc_not_ok(response)
         return response
 
-    def _execute(self, func_name, request, retry_on_http_error=False):
+    def _execute(self, func_name, request, safe_to_retry=False):
         # pylint: disable=protected-access
         # get the thrift transport
         transport = self.client._iprot.trans
         tries_left = self.retries
-        last_http_exception = None
+        last_exception = None
+        open_finished = False
         while tries_left > 0:
             try:
                 log.debug('Attempting to open transport (tries_left=%s)',
                           tries_left)
                 open_transport(transport)
+                open_finished = True
                 log.debug('Transport opened')
                 func = getattr(self.client, func_name)
                 return func(request)
-            except socket.error:
-                log.exception('Failed to open transport (tries_left=%s)',
-                              tries_left)
-                last_http_exception = None
-            except TTransportException:
-                log.exception('Failed to open transport (tries_left=%s)',
-                              tries_left)
-                last_http_exception = None
+            except (socket.error, TTransportException) as e:
+                if open_finished and not safe_to_retry: raise e
+                msg = "RPC failed" if open_finished else "Failed to open transport"
+                log.exception('%s (tries_left=%s)', msg, tries_left)
+                last_exception = e
             except HttpError as h:
-                if not retry_on_http_error:
+                if not safe_to_retry:
                     log.debug('Caught HttpError %s %s in %s which is not retryable',
                               h, str(h.body or ''), func_name)
                     raise
-                last_http_exception = h
+                last_exception = h
                 if tries_left > 1:
                     retry_secs = None
                     retry_after = h.http_headers.get('Retry-After', None)
@@ -1137,15 +1230,16 @@ class ThriftRPC(object):
                 raise
             log.debug('Closing transport (tries_left=%s)', tries_left)
             transport.close()
+            open_finished = False
             tries_left -= 1
 
-        if last_http_exception is not None:
-            raise last_http_exception
+        if last_exception:
+            raise last_exception
         raise HiveServer2Error('Failed after retrying {0} times'
                                .format(self.retries))
 
-    def _operation(self, kind, request, retry_on_http_error=False):
-        resp = self._rpc(kind, request, retry_on_http_error)
+    def _operation(self, kind, request, safe_to_retry=False):
+        resp = self._rpc(kind, request, safe_to_retry)
         return self._get_operation(resp.operationHandle)
 
     def _log_request(self, kind, request):
@@ -1346,7 +1440,7 @@ class Operation(ThriftRPC):
             resp = self._rpc('FetchResults', req, False)
             schema = [('Log', 'STRING', None, None, None, None, None)]
             log = self._wrap_results(resp.results, resp.hasMoreRows, schema,
-                                     convert_types=True)
+                convert_types=True, convert_strings_to_unicode=True)
             log = '\n'.join(l[0] for l in log)
         return log
 
@@ -1356,10 +1450,21 @@ class Operation(ThriftRPC):
         return self._rpc('CancelOperation', req, True)
 
     def close(self):
-        req = TCloseOperationReq(operationHandle=self.handle)
-        # CloseOperation rpc is not idempotent for dml and we're not sure
+        # Try Impala specific CloseImpalaOperation() as it also returns the number of
+        # modified rows for DML statements.
+        # If it doesn't exist (Hive, old Impala) fallback to regular HS2 CloseOperation()
+        # The RPCs are not retried as CloseOperation rpc is not idempotent for dml and we're not sure
         # here if this is dml or not.
-        return self._rpc('CloseOperation', req, False)
+        # TODO: we know in many cases that the query can't be a DML. Not sure if it worth putting
+        #       effort into retrying close()
+        try:
+            req = TCloseImpalaOperationReq(operationHandle=self.handle)
+            return self._rpc('CloseImpalaOperation', req, False)
+        except TApplicationException as e:
+            if not e.type == TApplicationException.UNKNOWN_METHOD:
+                raise
+            req = TCloseOperationReq(operationHandle=self.handle)
+            return self._rpc('CloseOperation', req, False)
 
     def get_profile(self, profile_format=TRuntimeProfileFormat.STRING):
         req = TGetRuntimeProfileReq(operationHandle=self.handle,
@@ -1380,7 +1485,7 @@ class Operation(ThriftRPC):
 
     def fetch(self, schema=None, max_rows=1024,
               orientation=TFetchOrientation.FETCH_NEXT,
-              convert_types=True):
+              convert_types=True, convert_strings_to_unicode=True):
         if not self.has_result_set:
             log.debug('fetch_results: has_result_set=False')
             return None
@@ -1396,15 +1501,18 @@ class Operation(ThriftRPC):
         # results are kept around for retry to be successful.
         resp = self._rpc('FetchResults', req, False)
         return self._wrap_results(resp.results, resp.hasMoreRows, schema,
-                                  convert_types=convert_types)
+                                  convert_types=convert_types, 
+                                  convert_strings_to_unicode=convert_strings_to_unicode)
 
-    def _wrap_results(self, results, expect_more_rows, schema, convert_types=True):
+    def _wrap_results(self, results, expect_more_rows, schema, convert_types=True, 
+                      convert_strings_to_unicode=True):
         if self.is_columnar:
             log.debug('fetch_results: constructing CBatch')
-            return CBatch(results, expect_more_rows, schema, convert_types=convert_types)
+            return CBatch(results, expect_more_rows, schema, convert_types=convert_types, 
+                          convert_strings_to_unicode=convert_strings_to_unicode)
         else:
             log.debug('fetch_results: constructing RBatch')
-            # TODO: RBatch ignores 'convert_types'
+            # TODO: RBatch ignores 'convert_types' and 'convert_strings_to_unicode'
             return RBatch(results, expect_more_rows, schema)
 
     @property

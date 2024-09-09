@@ -25,7 +25,7 @@ from impala.error import (  # noqa
     OperationalError, ProgrammingError, IntegrityError, DataError,
     NotSupportedError)
 from impala.util import (
-    warn_deprecate, warn_protocol_param, warn_unused_jwt, warn_nontls_jwt)
+    warn_deprecate, warn_protocol_param, warn_nontls_jwt)
 import impala.hiveserver2 as hs2
 
 
@@ -91,11 +91,11 @@ def connect(host='localhost', port=21050, database=None, timeout=None,
         name only, a str value can be specified instead of a list.
         If a cookie with one of these names is returned in an http response by the server
         or an intermediate proxy then it will be included in each subsequent request for
-        the same connection.
+        the same connection. If set to wildcard ('*'), all cookies in an http response
+        will be preserved. By default 'http_cookie_names' is set to '*'.
         Used only when `use_http_transport` is True.
-        By default 'http_cookie_names' is set to the list of HTTP cookie names used by
-        Impala and Hive. The names of authentication cookies are expected to end with
-        ".auth" string, for example, "impala.auth" for Impala authentication cookies.
+        The names of authentication cookies are expected to end with ".auth" string, for
+        example, "impala.auth" for Impala authentication cookies.
         If 'http_cookie_names' is explicitly set to a not None empty value ([], or ''),
         Impyla won't attempt to do cookie based authentication or session management.
         Currently cookie retention is supported for GSSAPI/LDAP/SASL/NOSASL/JWT over http.
@@ -163,10 +163,13 @@ def connect(host='localhost', port=21050, database=None, timeout=None,
             raise NotSupportedError('JWT authentication is only supported for HTTP transport')
         if not use_ssl:
             warn_nontls_jwt()
+        if user is not None or ldap_user is not None:
+            raise NotSupportedError("'user' argument cannot be specified with '{0}' authentication".format(auth_mechanism))
+        if password is not None or ldap_password is not None:
+            raise NotSupportedError("'password' argument cannot be specified with '{0}' authentication".format(auth_mechanism))
     else:
         if jwt is not None:
-            warn_unused_jwt()
-
+            raise NotSupportedError("'jwt' argument cannot be specified with '{0}' authentication".format(auth_mechanism))
 
     if ldap_user is not None:
         warn_deprecate('ldap_user', 'user')
@@ -188,8 +191,8 @@ def connect(host='localhost', port=21050, database=None, timeout=None,
         warn_deprecate('auth_cookie_names', 'http_cookie_names')
         http_cookie_names = auth_cookie_names
     elif http_cookie_names is None:
-        # Set default value as the list of HTTP cookie names used by Impala and Hive.
-        http_cookie_names = ['impala.auth', 'impala.session.id', 'hive.server2.auth']
+        # Preserve all cookies.
+        http_cookie_names = '*'
 
     service = hs2.connect(host=host, port=port,
                           timeout=timeout, use_ssl=use_ssl,
